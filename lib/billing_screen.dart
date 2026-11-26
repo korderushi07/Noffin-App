@@ -50,6 +50,7 @@ class _BillingScreenState extends State<BillingScreen> {
   Widget build(BuildContext context) {
     final today = BillingCycle.normalize(DateTime.now());
     final completedBills = widget.state.savedCycleBills.where((bill) {
+      if (bill.amount == null || !bill.isFinal) return false;
       final cycle = BillingCycle.fromYearMonth(
         year: bill.cycleStart.year,
         month: bill.cycleStart.month,
@@ -102,7 +103,7 @@ class _BillingScreenState extends State<BillingScreen> {
                         ),
                         const SizedBox(height: 8),
                         const Text(
-                          'If the error mentions the amount column, run the '
+                          'If the error mentions a paid_cycles column, run the '
                           'updated supabase/schema.sql in the Supabase SQL Editor.',
                           textAlign: TextAlign.center,
                           style: TextStyle(color: AppColors.secondaryText),
@@ -133,7 +134,7 @@ class _BillingScreenState extends State<BillingScreen> {
                           padding: const EdgeInsets.only(bottom: 12),
                           child: _PendingCycleCard(
                             bill: bill,
-                            amount: _billingCurrency.format(bill.amount),
+                            amount: _billingCurrency.format(bill.amount!),
                             onMarkPaid: () => widget.state.setCyclePaid(
                               cycleStart: bill.cycleStart,
                               isPaid: true,
@@ -160,7 +161,7 @@ class _BillingScreenState extends State<BillingScreen> {
                           children: [
                             _PastCycleRow(
                               bill: bill,
-                              amount: _billingCurrency.format(bill.amount),
+                              amount: _billingCurrency.format(bill.amount!),
                             ),
                             if (index < pastBills.length - 1)
                               const Divider(

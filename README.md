@@ -9,7 +9,7 @@ A minimal Android app for tracking mess tiffin absences on a billing-cycle calen
 2. **Run the Database Schema**:
    - In your Supabase dashboard, open the **SQL Editor**.
    - Copy and paste the contents of `supabase/schema.sql` and run it.
-   - If the project already has the schema, run the updated SQL again to add saved cycle amounts.
+   - If the project already has the schema, run the updated SQL again to add saved cycle amounts, rates, and finalization status.
 3. **Enable Email Authentication**:
    - In **Authentication** → **Sign In / Providers**, enable the **Email** provider for sign-in and account creation.
 4. **Retrieve API Keys**:

@@ -15,9 +15,13 @@ create table if not exists paid_cycles (
   is_paid boolean not null default false,
   paid_at timestamptz,
   amount numeric check (amount >= 0),
+  rate_per_tiffin numeric check (rate_per_tiffin >= 0),
+  is_final boolean not null default false,
   primary key (user_id, cycle_start)
 );
 alter table paid_cycles add column if not exists amount numeric check (amount >= 0);
+alter table paid_cycles add column if not exists rate_per_tiffin numeric check (rate_per_tiffin >= 0);
+alter table paid_cycles add column if not exists is_final boolean not null default false;
 alter table settings enable row level security;
 alter table absences enable row level security;
 alter table paid_cycles enable row level security;

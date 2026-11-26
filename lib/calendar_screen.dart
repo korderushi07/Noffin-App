@@ -14,6 +14,9 @@ class TiffinState extends ChangeNotifier {
   Map<DateTime, int> _completedAbsences = {};
   late BillingCycle _completedCycle;
   List<SavedCycleBill> _savedCycleBills = [];
+  final Set<DateTime> _savingAbsenceCycles = {};
+  Future<void> _settingsUpdateQueue = Future<void>.value();
+  bool _isNavigatingCycle = false;
   bool _isLoading = true;
   String? _billingLoadError;
 
@@ -29,6 +32,10 @@ class TiffinState extends ChangeNotifier {
   BillingCycle get currentCycle => _currentCycle;
   Map<DateTime, int> get absences => _absences;
   bool get isLoading => _isLoading;
+  bool get isCalendarBusy =>
+      _isLoading ||
+      _isNavigatingCycle ||
+      _savingAbsenceCycles.contains(_currentCycle.start);
   String? get billingLoadError => _billingLoadError;
   BillingCycle get completedCycle => _completedCycle;
   List<SavedCycleBill> get savedCycleBills =>
@@ -39,6 +46,12 @@ class TiffinState extends ChangeNotifier {
       _settings.cycleStartDay,
     );
     return _currentCycle.start.isBefore(currentCycle.start);
+  }
+
+  Future<void> _enqueueSettingsUpdate(Future<void> Function() update) {
+    final queuedUpdate = _settingsUpdateQueue.then((_) => update());
+    _settingsUpdateQueue = queuedUpdate.catchError((Object _) {});
+    return queuedUpdate;
   }
 
   int get fullDayMissedCount => _absences.values.where((m) => m == 2).length;
@@ -70,10 +83,14 @@ class TiffinState extends ChangeNotifier {
       );
       _completedCycle = _currentCycle.previous();
       await _loadCompletedCycle();
-      await _saveCycleBill(cycle: completedCycle, absences: _completedAbsences);
+      await _loadSavedCycleBills();
+      await _ensureFinalCycleBill(
+        cycle: completedCycle,
+        absences: _completedAbsences,
+      );
       final today = BillingCycle.normalize(DateTime.now());
       if (!today.isBefore(_currentCycle.end)) {
-        await _saveCycleBill(cycle: _currentCycle, absences: _absences);
+        await _ensureFinalCycleBill(cycle: _currentCycle, absences: _absences);
       }
       await _loadSavedCycleBills();
     } catch (error) {
@@ -85,16 +102,39 @@ class TiffinState extends ChangeNotifier {
   }
 
   Future<void> goToPreviousCycle({void Function(String)? onError}) async {
-    _currentCycle = _currentCycle.previous();
-    notifyListeners();
-    await _loadAbsencesForCurrentCycle(onError: onError);
+    await _navigateToCycle(_currentCycle.previous(), onError: onError);
   }
 
   Future<void> goToNextCycle({void Function(String)? onError}) async {
     if (!canNavigateToNextCycle) return;
-    _currentCycle = _currentCycle.next();
-    notifyListeners();
-    await _loadAbsencesForCurrentCycle(onError: onError);
+    await _navigateToCycle(_currentCycle.next(), onError: onError);
+  }
+
+  Future<void> _navigateToCycle(
+    BillingCycle cycle, {
+    void Function(String)? onError,
+  }) async {
+    if (_isNavigatingCycle) return;
+    if (_savingAbsenceCycles.contains(_currentCycle.start)) {
+      onError?.call('Wait for the attendance update to finish.');
+      return;
+    }
+
+    _isNavigatingCycle = true;
+    try {
+      final absences = await repository.getAbsencesForCycle(
+        userId: userId,
+        start: cycle.start,
+        end: cycle.end,
+      );
+      _currentCycle = cycle;
+      _absences = absences;
+      notifyListeners();
+    } catch (_) {
+      onError?.call('Unable to load absences. Please check connection.');
+    } finally {
+      _isNavigatingCycle = false;
+    }
   }
 
   Future<void> _loadCompletedCycle() async {
@@ -113,16 +153,63 @@ class TiffinState extends ChangeNotifier {
   Future<void> _saveCycleBill({
     required BillingCycle cycle,
     required Map<DateTime, int> absences,
+    required double ratePerTiffin,
   }) async {
     await repository.saveCycleBill(
       userId: userId,
       cycleStart: cycle.start,
+      ratePerTiffin: ratePerTiffin,
       amount: calculateCycleBill(
         cycle: cycle,
         absences: absences,
-        ratePerTiffin: _settings.rate,
+        ratePerTiffin: ratePerTiffin,
         asOf: cycle.end,
       ),
+    );
+  }
+
+  Future<void> _ensureFinalCycleBill({
+    required BillingCycle cycle,
+    required Map<DateTime, int> absences,
+  }) async {
+    SavedCycleBill? existingBill;
+    for (final bill in _savedCycleBills) {
+      if (bill.cycleStart == cycle.start) {
+        existingBill = bill;
+        break;
+      }
+    }
+
+    final rate = existingBill?.ratePerTiffin ?? _settings.rate;
+    final amount = calculateCycleBill(
+      cycle: cycle,
+      absences: absences,
+      ratePerTiffin: rate,
+      asOf: cycle.end,
+    );
+    if (existingBill != null &&
+        existingBill.amount != null &&
+        existingBill.isFinal &&
+        (existingBill.amount! - amount).abs() < 0.005) {
+      return;
+    }
+
+    if (existingBill != null &&
+        existingBill.isPaid &&
+        existingBill.amount != null &&
+        (existingBill.amount! - amount).abs() >= 0.005) {
+      await repository.setCyclePaid(
+        userId: userId,
+        cycleStart: cycle.start,
+        isPaid: false,
+      );
+    }
+
+    await repository.saveCycleBill(
+      userId: userId,
+      cycleStart: cycle.start,
+      amount: amount,
+      ratePerTiffin: rate,
     );
   }
 
@@ -159,7 +246,7 @@ class TiffinState extends ChangeNotifier {
           start: cycle.start,
           end: cycle.end,
         );
-        await _saveCycleBill(cycle: cycle, absences: absences);
+        await _ensureFinalCycleBill(cycle: cycle, absences: absences);
       }
       await _loadSavedCycleBills();
       _billingLoadError = null;
@@ -176,8 +263,14 @@ class TiffinState extends ChangeNotifier {
     required bool isPaid,
     void Function(String)? onError,
   }) async {
+    if (_savingAbsenceCycles.contains(cycleStart)) {
+      onError?.call('Wait for the attendance update to finish.');
+      return;
+    }
+
     final index = _savedCycleBills.indexWhere(
-      (bill) => bill.cycleStart == cycleStart,
+      (bill) =>
+          bill.cycleStart == cycleStart && bill.amount != null && bill.isFinal,
     );
     if (index < 0) return;
 
@@ -185,7 +278,9 @@ class TiffinState extends ChangeNotifier {
     _savedCycleBills[index] = SavedCycleBill(
       cycleStart: previousBill.cycleStart,
       amount: previousBill.amount,
+      ratePerTiffin: previousBill.ratePerTiffin,
       isPaid: isPaid,
+      isFinal: previousBill.isFinal,
     );
     notifyListeners();
     try {
@@ -201,28 +296,43 @@ class TiffinState extends ChangeNotifier {
     }
   }
 
-  Future<void> _loadAbsencesForCurrentCycle({
-    void Function(String)? onError,
-  }) async {
-    try {
-      _absences = await repository.getAbsencesForCycle(
-        userId: userId,
-        start: _currentCycle.start,
-        end: _currentCycle.end,
-      );
-      notifyListeners();
-    } catch (_) {
-      onError?.call('Unable to load absences. Please check connection.');
-    }
-  }
-
   Future<void> toggleAbsence(
     DateTime date, {
     required void Function(String message) onError,
   }) async {
     final normalized = BillingCycle.normalize(date);
+    final cycle = _currentCycle;
+    if (_isNavigatingCycle) {
+      onError('Wait for the billing cycle to finish loading.');
+      return;
+    }
+    if (normalized.isBefore(cycle.start) || normalized.isAfter(cycle.end)) {
+      onError('Date is outside the selected billing cycle.');
+      return;
+    }
+    if (!_savingAbsenceCycles.add(cycle.start)) return;
+
+    try {
+      await _toggleAbsenceInCycle(normalized, cycle: cycle, onError: onError);
+    } finally {
+      _savingAbsenceCycles.remove(cycle.start);
+    }
+  }
+
+  Future<void> _toggleAbsenceInCycle(
+    DateTime normalized, {
+    required BillingCycle cycle,
+    required void Function(String message) onError,
+  }) async {
     final currentMeals = _absences[normalized] ?? 0;
     final nextMeals = (currentMeals + 1) % 3;
+    SavedCycleBill? existingBill;
+    for (final bill in _savedCycleBills) {
+      if (bill.cycleStart == cycle.start) {
+        existingBill = bill;
+        break;
+      }
+    }
 
     // Optimistic update
     if (nextMeals == 0) {
@@ -254,15 +364,47 @@ class TiffinState extends ChangeNotifier {
     }
 
     final today = BillingCycle.normalize(DateTime.now());
-    if (!today.isBefore(_currentCycle.end)) {
+    if (!today.isBefore(cycle.end)) {
       try {
-        await _saveCycleBill(cycle: _currentCycle, absences: _absences);
+        final rate = existingBill?.ratePerTiffin ?? _settings.rate;
+        final updatedAmount = calculateCycleBill(
+          cycle: cycle,
+          absences: _absences,
+          ratePerTiffin: rate,
+          asOf: cycle.end,
+        );
+        final savedAmount = existingBill?.amount;
+        final amountChanged =
+            savedAmount == null || (savedAmount - updatedAmount).abs() >= 0.005;
+        if (existingBill?.isPaid == true && amountChanged) {
+          await repository.setCyclePaid(
+            userId: userId,
+            cycleStart: cycle.start,
+            isPaid: false,
+          );
+        }
+        await _saveCycleBill(
+          cycle: cycle,
+          absences: _absences,
+          ratePerTiffin: rate,
+        );
         await _loadSavedCycleBills();
         notifyListeners();
-      } catch (_) {
+      } catch (billUpdateError) {
+        try {
+          await _loadSavedCycleBills();
+          notifyListeners();
+        } catch (reloadError) {
+          onError(
+            'Attendance was saved, but updating the bill failed '
+            '($billUpdateError) and its latest status could not be loaded '
+            '($reloadError).',
+          );
+          return;
+        }
         onError(
-          'Absence saved, but the billing total could not be updated. '
-          'Reopen Billing to retry.',
+          'Attendance was saved, but its bill could not be updated '
+          '($billUpdateError). Reopen Billing to retry.',
         );
       }
     }
@@ -271,53 +413,75 @@ class TiffinState extends ChangeNotifier {
   Future<void> updateRate(
     double newRate, {
     void Function(String message)? onError,
-  }) async {
-    _settings = UserSettings(
+  }) => _enqueueSettingsUpdate(() async {
+    if (!newRate.isFinite || newRate < 0) {
+      onError?.call('Rate must be a non-negative number.');
+      return;
+    }
+
+    final nextSettings = UserSettings(
       rate: newRate,
       cycleStartDay: _settings.cycleStartDay,
     );
-    notifyListeners();
-
     try {
-      await repository.saveSettings(userId, _settings);
+      await repository.saveSettings(userId, nextSettings);
+      _settings = nextSettings;
+      notifyListeners();
     } catch (_) {
       onError?.call('Failed to save settings. Please check connection.');
     }
-  }
+  });
 
   Future<void> updateCycleStartDay(
     int newStartDay, {
     void Function(String message)? onError,
-  }) async {
+  }) => _enqueueSettingsUpdate(() async {
     if (newStartDay < 1 || newStartDay > 28) return;
-    final oldStartDay = _settings.cycleStartDay;
-    _settings = UserSettings(rate: _settings.rate, cycleStartDay: newStartDay);
-    // Instantly recalculate cycle containing today
-    _currentCycle = BillingCycle.forDate(DateTime.now(), newStartDay);
-    _completedCycle = _currentCycle.previous();
-    notifyListeners();
+    if (newStartDay == _settings.cycleStartDay) return;
+
+    final oldSettings = _settings;
+    final nextSettings = UserSettings(
+      rate: oldSettings.rate,
+      cycleStartDay: newStartDay,
+    );
+    final nextCycle = BillingCycle.forDate(DateTime.now(), newStartDay);
+    final nextCompletedCycle = nextCycle.previous();
+    var settingsSaved = false;
 
     try {
-      await repository.saveSettings(userId, _settings);
-      await _loadAbsencesForCurrentCycle(onError: onError);
-      await _loadCompletedCycle();
-      await _saveCycleBill(cycle: completedCycle, absences: _completedAbsences);
-      final today = BillingCycle.normalize(DateTime.now());
-      if (!today.isBefore(_currentCycle.end)) {
-        await _saveCycleBill(cycle: _currentCycle, absences: _absences);
-      }
-      await _loadSavedCycleBills();
-    } catch (_) {
-      _settings = UserSettings(
-        rate: _settings.rate,
-        cycleStartDay: oldStartDay,
+      await repository.saveSettings(userId, nextSettings);
+      settingsSaved = true;
+      final nextAbsences = await repository.getAbsencesForCycle(
+        userId: userId,
+        start: nextCycle.start,
+        end: nextCycle.end,
       );
-      _currentCycle = BillingCycle.forDate(DateTime.now(), oldStartDay);
-      _completedCycle = _currentCycle.previous();
+      final nextCompletedAbsences = await repository.getAbsencesForCycle(
+        userId: userId,
+        start: nextCompletedCycle.start,
+        end: nextCompletedCycle.end,
+      );
+      _settings = nextSettings;
+      _currentCycle = nextCycle;
+      _completedCycle = nextCompletedCycle;
+      _absences = nextAbsences;
+      _completedAbsences = nextCompletedAbsences;
       notifyListeners();
-      onError?.call('Failed to save settings. Please check connection.');
+    } catch (_) {
+      if (settingsSaved) {
+        try {
+          await repository.saveSettings(userId, oldSettings);
+        } catch (_) {
+          onError?.call(
+            'Failed to load the new cycle and restore previous settings. '
+            'Reopen the app to reload settings.',
+          );
+          return;
+        }
+      }
+      onError?.call('Failed to update the billing cycle. Please try again.');
     }
-  }
+  });
 }
 
 class CalendarScreen extends StatefulWidget {
@@ -376,15 +540,17 @@ class _CalendarScreenState extends State<CalendarScreen> {
                       color: AppColors.text,
                       size: 30,
                     ),
-                    onPressed: () => widget.state.goToPreviousCycle(
-                      onError: (msg) {
-                        if (context.mounted) {
-                          ScaffoldMessenger.of(
-                            context,
-                          ).showSnackBar(SnackBar(content: Text(msg)));
-                        }
-                      },
-                    ),
+                    onPressed: widget.state.isCalendarBusy
+                        ? null
+                        : () => widget.state.goToPreviousCycle(
+                            onError: (msg) {
+                              if (context.mounted) {
+                                ScaffoldMessenger.of(
+                                  context,
+                                ).showSnackBar(SnackBar(content: Text(msg)));
+                              }
+                            },
+                          ),
                   ),
                   Expanded(
                     child: Text(
@@ -405,7 +571,9 @@ class _CalendarScreenState extends State<CalendarScreen> {
                       color: AppColors.secondaryText,
                       size: 30,
                     ),
-                    onPressed: widget.state.canNavigateToNextCycle
+                    onPressed:
+                        !widget.state.isCalendarBusy &&
+                            widget.state.canNavigateToNextCycle
                         ? () => widget.state.goToNextCycle(
                             onError: (msg) {
                               if (context.mounted) {
@@ -570,20 +738,22 @@ class _CalendarScreenState extends State<CalendarScreen> {
                       borderRadius: BorderRadius.circular(12),
                       child: InkWell(
                         borderRadius: BorderRadius.circular(12),
-                        onTap: () => widget.state.toggleAbsence(
-                          date,
-                          onError: (msg) {
-                            if (context.mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text(msg),
-                                  behavior: SnackBarBehavior.floating,
-                                  duration: const Duration(seconds: 2),
-                                ),
-                              );
-                            }
-                          },
-                        ),
+                        onTap: widget.state.isCalendarBusy
+                            ? null
+                            : () => widget.state.toggleAbsence(
+                                date,
+                                onError: (msg) {
+                                  if (context.mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: Text(msg),
+                                        behavior: SnackBarBehavior.floating,
+                                        duration: const Duration(seconds: 2),
+                                      ),
+                                    );
+                                  }
+                                },
+                              ),
                         child: Container(
                           decoration: BoxDecoration(
                             borderRadius: BorderRadius.circular(12),

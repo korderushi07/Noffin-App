@@ -3,6 +3,22 @@ import 'package:tiffin/calendar_screen.dart';
 import 'package:tiffin/data/repository.dart';
 import 'package:tiffin/logic/cycle.dart';
 
+class FailingAbsencesRepository extends InMemoryTiffinRepository {
+  bool failLoads = false;
+
+  @override
+  Future<Map<DateTime, int>> getAbsencesForCycle({
+    required String userId,
+    required DateTime start,
+    required DateTime end,
+  }) {
+    if (failLoads) {
+      return Future.error(StateError('Absence load failed'));
+    }
+    return super.getAbsencesForCycle(userId: userId, start: start, end: end);
+  }
+}
+
 void main() {
   group('BillingCycle logic tests', () {
     test('date before and after the start day', () {
@@ -157,16 +173,19 @@ void main() {
         userId: 'user',
         cycleStart: DateTime(2026, 10, 10),
         amount: 1200,
+        ratePerTiffin: 50,
       );
       await repository.saveCycleBill(
         userId: 'user',
         cycleStart: DateTime(2026, 11, 10),
         amount: 950,
+        ratePerTiffin: 50,
       );
       await repository.saveCycleBill(
         userId: 'user',
         cycleStart: DateTime(2026, 11, 10),
         amount: 900,
+        ratePerTiffin: 50,
       );
 
       final bills = await repository.getSavedCycleBills('user');
@@ -187,24 +206,105 @@ void main() {
       expect(updatedBills.last.isPaid, isFalse);
     });
 
-    test('editing a completed cycle updates its saved amount', () async {
+    test(
+      'editing a paid completed cycle uses its saved rate and reopens payment',
+      () async {
+        final repository = InMemoryTiffinRepository();
+        final state = TiffinState(repository: repository, userId: 'user');
+        await state.init();
+        final completedCycle = state.currentCycle.previous();
+        await state.goToPreviousCycle();
+        await state.setCyclePaid(
+          cycleStart: completedCycle.start,
+          isPaid: true,
+        );
+        await state.updateRate(75);
+
+        await state.toggleAbsence(
+          completedCycle.start,
+          onError: (message) => fail(message),
+        );
+
+        final savedBill = state.savedCycleBills.firstWhere(
+          (bill) => bill.cycleStart == completedCycle.start,
+        );
+        expect(
+          savedBill.amount,
+          equals((completedCycle.daysCount * 2 - 1) * 50),
+        );
+        expect(savedBill.ratePerTiffin, 50);
+        expect(savedBill.isPaid, isFalse);
+        state.dispose();
+      },
+    );
+
+    test('refresh preserves finalized totals after a rate change', () async {
       final repository = InMemoryTiffinRepository();
       final state = TiffinState(repository: repository, userId: 'user');
       await state.init();
-      final completedCycle = state.currentCycle.previous();
-      await state.goToPreviousCycle();
-
-      await state.toggleAbsence(
-        completedCycle.start,
-        onError: (message) => fail(message),
+      final cycleStart = state.completedCycle.start;
+      final before = state.savedCycleBills.firstWhere(
+        (bill) => bill.cycleStart == cycleStart,
       );
 
-      final savedBill = state.savedCycleBills.firstWhere(
-        (bill) => bill.cycleStart == completedCycle.start,
+      await state.updateRate(80);
+      await state.refreshCompletedCycleBills();
+
+      final after = state.savedCycleBills.firstWhere(
+        (bill) => bill.cycleStart == cycleStart,
       );
-      expect(savedBill.amount, equals((completedCycle.daysCount * 2 - 1) * 50));
+      expect(after.amount, before.amount);
+      expect(after.ratePerTiffin, 50);
       state.dispose();
     });
+
+    test(
+      'refresh reconciles remote absence edits and reopens changed bills',
+      () async {
+        final repository = InMemoryTiffinRepository();
+        final state = TiffinState(repository: repository, userId: 'user');
+        await state.init();
+        final cycle = state.completedCycle;
+        await state.setCyclePaid(cycleStart: cycle.start, isPaid: true);
+        final before = state.savedCycleBills.firstWhere(
+          (bill) => bill.cycleStart == cycle.start,
+        );
+        await repository.setAbsence(userId: 'user', day: cycle.start, meals: 2);
+
+        await state.refreshCompletedCycleBills();
+
+        final after = state.savedCycleBills.firstWhere(
+          (bill) => bill.cycleStart == cycle.start,
+        );
+        expect(after.amount, before.amount! - 100);
+        expect(after.isPaid, isFalse);
+        state.dispose();
+      },
+    );
+
+    test(
+      'failed cycle navigation keeps the previous cycle and absences',
+      () async {
+        final repository = FailingAbsencesRepository();
+        final state = TiffinState(repository: repository, userId: 'user');
+        await state.init();
+        final cycleBeforeNavigation = state.currentCycle;
+        final absencesBeforeNavigation = Map<DateTime, int>.of(state.absences);
+        String? errorMessage;
+        repository.failLoads = true;
+
+        await state.goToPreviousCycle(
+          onError: (message) {
+            errorMessage = message;
+          },
+        );
+
+        expect(state.currentCycle, cycleBeforeNavigation);
+        expect(state.absences, absencesBeforeNavigation);
+        expect(errorMessage, isNotNull);
+        state.dispose();
+      },
+    );
 
     test('formatRange produces correct strings', () {
       final cycle = BillingCycle(
