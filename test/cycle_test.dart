@@ -1,4 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:tiffin/calendar_screen.dart';
+import 'package:tiffin/data/repository.dart';
 import 'package:tiffin/logic/cycle.dart';
 
 void main() {
@@ -127,6 +129,81 @@ void main() {
       );
       expect(bill, equals(2600.0));
       expect(formatBill(bill), equals('₹2,600'));
+    });
+
+    test(
+      'current-cycle bill counts meals only through the calculation date',
+      () {
+        final cycle = BillingCycle.fromYearMonth(
+          year: 2026,
+          month: 11,
+          startDay: 1,
+        );
+
+        final amount = calculateCycleBill(
+          cycle: cycle,
+          absences: {DateTime(2026, 11, 2): 1},
+          ratePerTiffin: 50,
+          asOf: DateTime(2026, 11, 3),
+        );
+
+        expect(amount, equals(250));
+      },
+    );
+
+    test('saved cycle bills stay separate by cycle start month', () async {
+      final repository = InMemoryTiffinRepository();
+      await repository.saveCycleBill(
+        userId: 'user',
+        cycleStart: DateTime(2026, 10, 10),
+        amount: 1200,
+      );
+      await repository.saveCycleBill(
+        userId: 'user',
+        cycleStart: DateTime(2026, 11, 10),
+        amount: 950,
+      );
+      await repository.saveCycleBill(
+        userId: 'user',
+        cycleStart: DateTime(2026, 11, 10),
+        amount: 900,
+      );
+
+      final bills = await repository.getSavedCycleBills('user');
+
+      expect(bills.map((bill) => bill.cycleStart).toList(), [
+        DateTime(2026, 11, 10),
+        DateTime(2026, 10, 10),
+      ]);
+      expect(bills.map((bill) => bill.amount).toList(), [900, 1200]);
+
+      await repository.setCyclePaid(
+        userId: 'user',
+        cycleStart: DateTime(2026, 11, 10),
+        isPaid: true,
+      );
+      final updatedBills = await repository.getSavedCycleBills('user');
+      expect(updatedBills.first.isPaid, isTrue);
+      expect(updatedBills.last.isPaid, isFalse);
+    });
+
+    test('editing a completed cycle updates its saved amount', () async {
+      final repository = InMemoryTiffinRepository();
+      final state = TiffinState(repository: repository, userId: 'user');
+      await state.init();
+      final completedCycle = state.currentCycle.previous();
+      await state.goToPreviousCycle();
+
+      await state.toggleAbsence(
+        completedCycle.start,
+        onError: (message) => fail(message),
+      );
+
+      final savedBill = state.savedCycleBills.firstWhere(
+        (bill) => bill.cycleStart == completedCycle.start,
+      );
+      expect(savedBill.amount, equals((completedCycle.daysCount * 2 - 1) * 50));
+      state.dispose();
     });
 
     test('formatRange produces correct strings', () {

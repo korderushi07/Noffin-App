@@ -14,8 +14,10 @@ create table if not exists paid_cycles (
   cycle_start date not null,
   is_paid boolean not null default false,
   paid_at timestamptz,
+  amount numeric check (amount >= 0),
   primary key (user_id, cycle_start)
 );
+alter table paid_cycles add column if not exists amount numeric check (amount >= 0);
 alter table settings enable row level security;
 alter table absences enable row level security;
 alter table paid_cycles enable row level security;

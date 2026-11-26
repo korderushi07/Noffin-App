@@ -13,8 +13,9 @@ class TiffinState extends ChangeNotifier {
   Map<DateTime, int> _absences = {};
   Map<DateTime, int> _completedAbsences = {};
   late BillingCycle _completedCycle;
-  bool _completedCyclePaid = false;
+  List<SavedCycleBill> _savedCycleBills = [];
   bool _isLoading = true;
+  String? _billingLoadError;
 
   TiffinState({required this.repository, required this.userId}) {
     _currentCycle = BillingCycle.forDate(
@@ -28,8 +29,10 @@ class TiffinState extends ChangeNotifier {
   BillingCycle get currentCycle => _currentCycle;
   Map<DateTime, int> get absences => _absences;
   bool get isLoading => _isLoading;
+  String? get billingLoadError => _billingLoadError;
   BillingCycle get completedCycle => _completedCycle;
-  bool get completedCyclePaid => _completedCyclePaid;
+  List<SavedCycleBill> get savedCycleBills =>
+      List.unmodifiable(_savedCycleBills);
   bool get canNavigateToNextCycle {
     final currentCycle = BillingCycle.forDate(
       DateTime.now(),
@@ -38,36 +41,21 @@ class TiffinState extends ChangeNotifier {
     return _currentCycle.start.isBefore(currentCycle.start);
   }
 
-  bool get isPaymentReminderDue {
-    final today = BillingCycle.normalize(DateTime.now());
-    return !today.isBefore(completedCycle.paymentDueDate) &&
-        !completedCyclePaid;
-  }
-
   int get fullDayMissedCount => _absences.values.where((m) => m == 2).length;
   int get singleTiffinMissedCount =>
       _absences.values.where((m) => m == 1).length;
   int get missedMealsCount => fullDayMissedCount * 2 + singleTiffinMissedCount;
 
-  double get currentBill => calculateBill(
-    daysInCycle: _currentCycle.daysCount,
-    missedMeals: missedMealsCount,
+  double get completedBill => calculateCycleBill(
+    cycle: completedCycle,
+    absences: _completedAbsences,
     ratePerTiffin: _settings.rate,
+    asOf: completedCycle.end,
   );
-
-  double get completedBill {
-    final fullDays = _completedAbsences.values.where((m) => m == 2).length;
-    final singleMeals = _completedAbsences.values.where((m) => m == 1).length;
-    final missedMeals = fullDays * 2 + singleMeals;
-    return calculateBill(
-      daysInCycle: completedCycle.daysCount,
-      missedMeals: missedMeals,
-      ratePerTiffin: _settings.rate,
-    );
-  }
 
   Future<void> init() async {
     _isLoading = true;
+    _billingLoadError = null;
     notifyListeners();
     try {
       _settings = await repository.getOrInitSettings(userId);
@@ -82,8 +70,14 @@ class TiffinState extends ChangeNotifier {
       );
       _completedCycle = _currentCycle.previous();
       await _loadCompletedCycle();
-    } catch (_) {
-      // Offline fallback: keep default settings
+      await _saveCycleBill(cycle: completedCycle, absences: _completedAbsences);
+      final today = BillingCycle.normalize(DateTime.now());
+      if (!today.isBefore(_currentCycle.end)) {
+        await _saveCycleBill(cycle: _currentCycle, absences: _absences);
+      }
+      await _loadSavedCycleBills();
+    } catch (error) {
+      _billingLoadError = error.toString();
     } finally {
       _isLoading = false;
       notifyListeners();
@@ -110,27 +104,98 @@ class TiffinState extends ChangeNotifier {
       start: cycle.start,
       end: cycle.end,
     );
-    _completedCyclePaid = await repository.isCyclePaid(
+  }
+
+  Future<void> _loadSavedCycleBills() async {
+    _savedCycleBills = await repository.getSavedCycleBills(userId);
+  }
+
+  Future<void> _saveCycleBill({
+    required BillingCycle cycle,
+    required Map<DateTime, int> absences,
+  }) async {
+    await repository.saveCycleBill(
       userId: userId,
       cycleStart: cycle.start,
+      amount: calculateCycleBill(
+        cycle: cycle,
+        absences: absences,
+        ratePerTiffin: _settings.rate,
+        asOf: cycle.end,
+      ),
     );
   }
 
-  Future<void> setCompletedCyclePaid({
+  Future<void> refreshCompletedCycleBills({
+    void Function(String)? onError,
+  }) async {
+    if (_isLoading) return;
+
+    try {
+      final today = BillingCycle.normalize(DateTime.now());
+      final activeCycle = BillingCycle.forDate(today, _settings.cycleStartDay);
+      final cyclesToSave = <DateTime, BillingCycle>{
+        activeCycle.previous().start: activeCycle.previous(),
+      };
+      if (!today.isBefore(activeCycle.end)) {
+        cyclesToSave[activeCycle.start] = activeCycle;
+      }
+
+      await _loadSavedCycleBills();
+      for (final bill in _savedCycleBills) {
+        final cycle = BillingCycle.fromYearMonth(
+          year: bill.cycleStart.year,
+          month: bill.cycleStart.month,
+          startDay: bill.cycleStart.day,
+        );
+        if (!today.isBefore(cycle.end)) {
+          cyclesToSave[cycle.start] = cycle;
+        }
+      }
+
+      for (final cycle in cyclesToSave.values) {
+        final absences = await repository.getAbsencesForCycle(
+          userId: userId,
+          start: cycle.start,
+          end: cycle.end,
+        );
+        await _saveCycleBill(cycle: cycle, absences: absences);
+      }
+      await _loadSavedCycleBills();
+      _billingLoadError = null;
+      notifyListeners();
+    } catch (error) {
+      _billingLoadError = error.toString();
+      notifyListeners();
+      onError?.call('Unable to refresh completed billing cycles.');
+    }
+  }
+
+  Future<void> setCyclePaid({
+    required DateTime cycleStart,
     required bool isPaid,
     void Function(String)? onError,
   }) async {
-    final previousPaid = _completedCyclePaid;
-    _completedCyclePaid = isPaid;
+    final index = _savedCycleBills.indexWhere(
+      (bill) => bill.cycleStart == cycleStart,
+    );
+    if (index < 0) return;
+
+    final previousBill = _savedCycleBills[index];
+    _savedCycleBills[index] = SavedCycleBill(
+      cycleStart: previousBill.cycleStart,
+      amount: previousBill.amount,
+      isPaid: isPaid,
+    );
     notifyListeners();
     try {
       await repository.setCyclePaid(
         userId: userId,
-        cycleStart: completedCycle.start,
+        cycleStart: cycleStart,
         isPaid: isPaid,
       );
     } catch (_) {
-      _completedCyclePaid = previousPaid;
+      _savedCycleBills[index] = previousBill;
       notifyListeners();
       onError?.call('Failed to update payment status.');
     }
@@ -178,7 +243,6 @@ class TiffinState extends ChangeNotifier {
         );
       }
     } catch (_) {
-      // Rollback
       if (currentMeals == 0) {
         _absences.remove(normalized);
       } else {
@@ -186,6 +250,21 @@ class TiffinState extends ChangeNotifier {
       }
       notifyListeners();
       onError('Failed to save absence. Please check connection.');
+      return;
+    }
+
+    final today = BillingCycle.normalize(DateTime.now());
+    if (!today.isBefore(_currentCycle.end)) {
+      try {
+        await _saveCycleBill(cycle: _currentCycle, absences: _absences);
+        await _loadSavedCycleBills();
+        notifyListeners();
+      } catch (_) {
+        onError(
+          'Absence saved, but the billing total could not be updated. '
+          'Reopen Billing to retry.',
+        );
+      }
     }
   }
 
@@ -216,18 +295,25 @@ class TiffinState extends ChangeNotifier {
     // Instantly recalculate cycle containing today
     _currentCycle = BillingCycle.forDate(DateTime.now(), newStartDay);
     _completedCycle = _currentCycle.previous();
-    _loadCompletedCycle();
     notifyListeners();
 
     try {
       await repository.saveSettings(userId, _settings);
       await _loadAbsencesForCurrentCycle(onError: onError);
+      await _loadCompletedCycle();
+      await _saveCycleBill(cycle: completedCycle, absences: _completedAbsences);
+      final today = BillingCycle.normalize(DateTime.now());
+      if (!today.isBefore(_currentCycle.end)) {
+        await _saveCycleBill(cycle: _currentCycle, absences: _absences);
+      }
+      await _loadSavedCycleBills();
     } catch (_) {
       _settings = UserSettings(
         rate: _settings.rate,
         cycleStartDay: oldStartDay,
       );
       _currentCycle = BillingCycle.forDate(DateTime.now(), oldStartDay);
+      _completedCycle = _currentCycle.previous();
       notifyListeners();
       onError?.call('Failed to save settings. Please check connection.');
     }

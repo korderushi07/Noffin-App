@@ -46,6 +46,18 @@ class UserSettings {
   };
 }
 
+class SavedCycleBill {
+  final DateTime cycleStart;
+  final double amount;
+  final bool isPaid;
+
+  const SavedCycleBill({
+    required this.cycleStart,
+    required this.amount,
+    this.isPaid = false,
+  });
+}
+
 abstract class TiffinRepository {
   factory TiffinRepository(SupabaseClient client) = SupabaseTiffinRepository;
 
@@ -70,6 +82,12 @@ abstract class TiffinRepository {
     required String userId,
     required DateTime cycleStart,
     required bool isPaid,
+  });
+  Future<List<SavedCycleBill>> getSavedCycleBills(String userId);
+  Future<void> saveCycleBill({
+    required String userId,
+    required DateTime cycleStart,
+    required double amount,
   });
 }
 
@@ -183,12 +201,45 @@ class SupabaseTiffinRepository implements TiffinRepository {
       'paid_at': isPaid ? DateTime.now().toUtc().toIso8601String() : null,
     });
   }
+
+  @override
+  Future<List<SavedCycleBill>> getSavedCycleBills(String userId) async {
+    final response = await _client
+        .from('paid_cycles')
+        .select('cycle_start, amount, is_paid')
+        .eq('user_id', userId)
+        .not('amount', 'is', null)
+        .order('cycle_start', ascending: false);
+
+    return response.map<SavedCycleBill>((row) {
+      final cycleStart = DateTime.parse(row['cycle_start'] as String);
+      return SavedCycleBill(
+        cycleStart: DateTime(cycleStart.year, cycleStart.month, cycleStart.day),
+        amount: (row['amount'] as num).toDouble(),
+        isPaid: row['is_paid'] as bool? ?? false,
+      );
+    }).toList();
+  }
+
+  @override
+  Future<void> saveCycleBill({
+    required String userId,
+    required DateTime cycleStart,
+    required double amount,
+  }) async {
+    await _client.from('paid_cycles').upsert({
+      'user_id': userId,
+      'cycle_start': formatDate(cycleStart),
+      'amount': amount,
+    });
+  }
 }
 
 class InMemoryTiffinRepository implements TiffinRepository {
   UserSettings _settings = const UserSettings(rate: 50.0, cycleStartDay: 10);
   final Map<DateTime, int> _absences = {};
   final Set<DateTime> _paidCycles = {};
+  final Map<DateTime, double> _cycleBills = {};
 
   InMemoryTiffinRepository() {
     // Pre-seed sample data matching the specification example:
@@ -269,5 +320,35 @@ class InMemoryTiffinRepository implements TiffinRepository {
     } else {
       _paidCycles.remove(normalized);
     }
+  }
+
+  @override
+  Future<List<SavedCycleBill>> getSavedCycleBills(String userId) async {
+    final bills =
+        _cycleBills.entries
+            .map(
+              (entry) =>
+                  SavedCycleBill(cycleStart: entry.key, amount: entry.value),
+            )
+            .toList()
+          ..sort((a, b) => b.cycleStart.compareTo(a.cycleStart));
+    return bills
+        .map(
+          (bill) => SavedCycleBill(
+            cycleStart: bill.cycleStart,
+            amount: bill.amount,
+            isPaid: _paidCycles.contains(bill.cycleStart),
+          ),
+        )
+        .toList();
+  }
+
+  @override
+  Future<void> saveCycleBill({
+    required String userId,
+    required DateTime cycleStart,
+    required double amount,
+  }) async {
+    _cycleBills[BillingCycle.normalize(cycleStart)] = amount;
   }
 }

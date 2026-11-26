@@ -165,6 +165,31 @@ double calculateBill({
   return toPay < 0 ? 0.0 : toPay;
 }
 
+/// Calculate the bill for meals taken in [cycle] through [asOf].
+double calculateCycleBill({
+  required BillingCycle cycle,
+  required Map<DateTime, int> absences,
+  required double ratePerTiffin,
+  required DateTime asOf,
+}) {
+  final cutoff = BillingCycle.normalize(asOf);
+  final elapsedDays = cycle.days.where((day) => !day.isAfter(cutoff)).length;
+  final missedMeals = absences.entries
+      .where(
+        (entry) =>
+            !entry.key.isBefore(cycle.start) &&
+            !entry.key.isAfter(cutoff) &&
+            !entry.key.isAfter(cycle.end),
+      )
+      .fold<int>(0, (total, entry) => total + entry.value);
+
+  return calculateBill(
+    daysInCycle: elapsedDays,
+    missedMeals: missedMeals,
+    ratePerTiffin: ratePerTiffin,
+  );
+}
+
 /// Formats bill amount for UI (e.g., ₹2,600 or ₹2,600.50)
 String formatBill(double amount) {
   final formatter = NumberFormat.currency(
